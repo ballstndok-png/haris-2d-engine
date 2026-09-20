@@ -1,0 +1,3 @@
+Haris 2D Engine for Android
+Engine version: 1.0.0
+Haris runtime base: Forge v10.2.0

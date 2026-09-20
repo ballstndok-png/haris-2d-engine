@@ -1,0 +1,288 @@
+static long long cpu_ms(void){return (long long)((double)clock()*1000.0/(double)CLOCKS_PER_SEC);}
+static long long wall_ms(void){
+#ifdef CLOCK_MONOTONIC
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (long long)ts.tv_sec*1000LL+(long long)ts.tv_nsec/1000000LL;
+#else
+    return cpu_ms();
+#endif
+}
+static int apply_cpu_affinity(VM*vm){
+    if(!vm)return 0;if(vm->cpu_cores<=0){vm->cpu_affinity_ok=1;return 1;}
+#ifdef _WIN32
+    SYSTEM_INFO si;GetSystemInfo(&si);int n=(int)si.dwNumberOfProcessors;if(n<1)n=1;if(vm->cpu_cores>n)vm->cpu_cores=n;DWORD_PTR mask=0;for(int i=0;i<vm->cpu_cores&&i<(int)(sizeof(DWORD_PTR)*8);i++)mask|=((DWORD_PTR)1<<i);vm->cpu_affinity_ok=(mask!=0&&SetProcessAffinityMask(GetCurrentProcess(),mask)!=0);return vm->cpu_affinity_ok;
+#elif defined(__linux__) && !defined(__ANDROID__)
+    int n=(int)sysconf(_SC_NPROCESSORS_ONLN);if(n<1)n=1;if(vm->cpu_cores>n)vm->cpu_cores=n;cpu_set_t set;CPU_ZERO(&set);for(int i=0;i<vm->cpu_cores;i++)CPU_SET(i,&set);vm->cpu_affinity_ok=(sched_setaffinity(0,sizeof(set),&set)==0);return vm->cpu_affinity_ok;
+#else
+    vm->cpu_affinity_ok=0;return 0;
+#endif
+}
+static void runtime_budget_check(VM*vm){
+    if(vm->cpu_limit_ms>0 && cpu_ms()-vm->start_cpu_ms>vm->cpu_limit_ms)
+        die("Haris: CPU time limit exceeded (%lld ms)",vm->cpu_limit_ms);
+    if(vm->cpu_percent>0 && vm->cpu_percent<100){
+        long long noww=wall_ms(), nowc=cpu_ms();
+        if(vm->cpu_slice_wall_ms==0){vm->cpu_slice_wall_ms=noww;vm->cpu_slice_cpu_ms=nowc;}
+        long long w=noww-vm->cpu_slice_wall_ms, c=nowc-vm->cpu_slice_cpu_ms;
+        if(w>=50){
+            long long allowed=(w*vm->cpu_percent)/100;
+            if(c>allowed){
+                long long sleep_ms=c-allowed;
+                if(sleep_ms>0){struct timespec ts={(time_t)(sleep_ms/1000),(long)((sleep_ms%1000)*1000000L)};nanosleep(&ts,NULL);}
+            }
+            vm->cpu_slice_wall_ms=wall_ms(); vm->cpu_slice_cpu_ms=cpu_ms();
+        }
+    }
+}
+
+static void gc_mark_late_handle(void*p,int kind){
+#ifdef HK_GFX
+    if(kind==HK_GFX){HGfxWindow*w=p;if(w->title)gc_mark_ptr(w->title);return;}
+#endif
+    if(kind==HK_MEMBUF){HMemBuf*m=p;if(m->owned&&m->data)gc_mark_ptr(m->data);return;}
+    if(kind==HK_ASYNC){AsyncTask*t=p;if(t->file)gc_mark_ptr(t->file);if(t->fn)gc_mark_fn(t->fn);if(t->args){gc_mark_ptr(t->args);for(int i=0;i<t->argc;i++)gc_mark_value(t->args[i]);}gc_mark_value(t->result);return;}
+}
+
+static void runtime_safe_point(VM*vm,int sp,int fp){if(!vm)return;if(g_mem_used>=g_gc_next){vm->sp=sp;vm->fp=fp;if(gc_minor(vm)==0&&g_mem_used>=g_gc_next*2)gc_collect(vm);}}
+
+static HARIS_HOT Value vm_execute(VM*vm,Fn*f,int argc,Value*args){
+    EXEC_LOCK();
+    vm->int_overflow=0;
+    vm->last_error=0;
+    VM *prev_runtime=g_runtime_vm; size_t prev_mem_limit=g_mem_limit; int saved_err_depth=vm->err_depth;
+    if(vm->jmp_depth>=32)die("Haris runtime: error-handler nesting overflow");
+    int jmp_slot=vm->jmp_depth++;
+    vm->err_depth=0; vm->err_active=0;
+    g_runtime_vm=vm; g_mem_limit=vm->mem_limit_bytes; active_vm_add(vm);
+    vm->fp=1; vm->sp=0;
+    vm->start_cpu_ms=cpu_ms();
+    g_mem_limit=vm->mem_limit_bytes;
+#define HPUSH(v) do{if(HARIS_UNLIKELY(sp>=H_STACK_MAX))die("Haris runtime: value stack overflow");st[sp++]=(v);}while(0)
+#define HPOP() (HARIS_UNLIKELY(sp<=0)?(die("Haris runtime: value stack underflow"),vn()):st[--sp])
+#define HRETURN(v) do{vm->sp=sp;vm->fp=fp;vm->err_depth=saved_err_depth;vm->err_active=0;if(vm->jmp_depth>0)vm->jmp_depth--;active_vm_del(vm);g_runtime_vm=prev_runtime;g_mem_limit=prev_mem_limit;EXEC_UNLOCK();return(v);}while(0)
+    /* Hot-loop optimization: keep stack pointer, stack base and frame array in
+       locals.  The old interpreter performed a VM struct load/store for nearly
+       every bytecode instruction. */
+    Value *st=vm->st;
+    int sp=0, fp=1;
+    Frame *frames=vm->fr;
+    frames[0]=(Frame){0,0,f};
+    if(argc<0||argc>H_CALL_MAX)die("Haris runtime: invalid argument count");
+    if(!f->is_root) HPUSH(vn());
+    for(int i=0;i<argc;i++) HPUSH(args[i]);
+    while(sp < (f->is_root ? f->nlocals : 1+f->np+f->nlocals)) HPUSH(vn());
+
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(HARIS_PORTABLE)
+    /* Direct-threaded dispatch avoids the branch-heavy opcode switch on GCC/Clang. */
+    static void *dispatch[] = {
+        &&L_CONST,&&L_GET,&&L_GETL,&&L_SETG,&&L_SETL,&&L_MAKE_CLOSURE,&&L_POP,&&L_ADD,&&L_SUB,&&L_MUL,&&L_DIV,
+        &&L_MOD,&&L_NEG,&&L_NOT,&&L_EQ,&&L_NEQ,&&L_LT,&&L_LTE,&&L_GT,&&L_GTE,&&L_AND,&&L_OR,
+        &&L_JMP,&&L_JMPF,&&L_CALL,&&L_RET,&&L_ARRAY,&&L_INDEX,&&L_SETINDEX,&&L_FIELD,&&L_SETFIELD,&&L_STRUCT,&&L_TYPECHECK,&&L_TRY,&&L_ENDTRY,&&L_JMPNULL,&&L_HALT,
+        &&L_INC_LOCAL,&&L_DEC_LOCAL,&&L_LOCAL_CONST_ADD,&&L_LOCAL_CONST_SUB,&&L_LOCAL_CONST_MUL,&&L_LOCAL_CONST_DIV,&&L_LOCAL_CONST_MOD,&&L_LOCAL_BIN,&&L_LOCAL_CMP_JMPF
+    };
+    _Static_assert(sizeof(dispatch)/sizeof(dispatch[0]) == (size_t)I_OP_COUNT,
+                   "Haris: direct dispatch table out of sync with Op enum");
+#define DISPATCH() do{if((++ticks & 4095u)==0){runtime_budget_check(vm);if(g_mem_used>=g_gc_next){vm->sp=sp;vm->fp=fp;if(gc_minor(vm)==0 || g_mem_used>=g_gc_next*2)gc_collect(vm);}}goto *dispatch[code[ip].op];}while(0)
+    Fn *fn=f; Ins *code=fn->ch.v; Value *cons=fn->ch.c; int ip=0, base=0; unsigned long long ticks=0; g_runtime_vm=vm;
+    if(setjmp(vm->jmp_stack[jmp_slot])!=0){ if(!vm->err_active){vm->last_error=1;HRETURN(vn());} vm->err_active=0; if(vm->err_depth<=0){vm->last_error=1;fprintf(stderr,"Haris runtime error: %s\n",vm->err_msg);HRETURN(vn());}
+        struct ErrFrame eh=vm->err_frames[vm->err_depth-1];vm->err_depth--;vm->err_ip=eh.ip;vm->err_fp=eh.fp;vm->err_sp=eh.sp;vm->sp=eh.sp;sp=eh.sp;fp=eh.fp;Frame *ef=&frames[fp-1];fn=ef->fn;code=fn->ch.v;cons=fn->ch.c;ip=eh.ip;base=ef->base; HPUSH(vs(vm->err_msg)); }
+    DISPATCH();
+L_CONST: HPUSH(cons[code[ip].a]); ip++; DISPATCH();
+L_GETL: {int idx=base+1+code[ip].a;if(idx>=sp)die("Haris runtime: invalid argument index");HPUSH(st[idx]);ip++;DISPATCH();}
+L_SETL: {int idx=base+1+code[ip].a;if(idx<base+1||idx>=sp)die("Haris runtime: invalid local slot");st[idx]=st[--sp];ip++;DISPATCH();}
+L_INC_LOCAL: {int idx=base+1+code[ip].a;if(idx<base+1||idx>=sp)die("Haris runtime: invalid local slot");Value v=st[idx];if(v.t==VINT)st[idx]=vi(int_binop(vm,I_ADD,v.u.i,1));else if(v.t==VFLOAT)st[idx]=vf(v.u.f+1.0);else die("numeric operator needs number");ip++;DISPATCH();}
+L_DEC_LOCAL: {int idx=base+1+code[ip].a;if(idx<base+1||idx>=sp)die("Haris runtime: invalid local slot");Value v=st[idx];if(v.t==VINT)st[idx]=vi(int_binop(vm,I_SUB,v.u.i,1));else if(v.t==VFLOAT)st[idx]=vf(v.u.f-1.0);else die("numeric operator needs number");ip++;DISPATCH();}
+#define LOCAL_CONST_BIN(OPCODE,OP) do{int idx=base+1+code[ip].a,ci=code[ip].b;if(idx<base+1||idx>=sp||ci<0||ci>=fn->ch.nc)die("Haris runtime: invalid specialized arithmetic operands");Value v=st[idx],cst=cons[ci];if(v.t==VINT&&cst.t==VINT)st[idx]=vi(int_binop(vm,(OP),v.u.i,cst.u.i));else if(isnum(v)&&cst.t==VINT){double y=(double)cst.u.i;if((OP)==I_DIV&&y==0.0)die("division by zero");st[idx]=vf((OP)==I_ADD?v.u.f+y:(OP)==I_SUB?v.u.f-y:(OP)==I_MUL?v.u.f*y:(OP)==I_DIV?v.u.f/y:fmod(v.u.f,y));}else die("numeric operator needs numbers");ip++;DISPATCH();}while(0)
+L_LOCAL_CONST_ADD: LOCAL_CONST_BIN(I_LOCAL_CONST_ADD,I_ADD);
+L_LOCAL_CONST_SUB: LOCAL_CONST_BIN(I_LOCAL_CONST_SUB,I_SUB);
+L_LOCAL_CONST_MUL: LOCAL_CONST_BIN(I_LOCAL_CONST_MUL,I_MUL);
+L_LOCAL_CONST_DIV: LOCAL_CONST_BIN(I_LOCAL_CONST_DIV,I_DIV);
+L_LOCAL_CONST_MOD: LOCAL_CONST_BIN(I_LOCAL_CONST_MOD,I_MOD);
+#undef LOCAL_CONST_BIN
+L_LOCAL_BIN: {
+    int di=base+1+code[ip].a,si=base+1+code[ip].b;
+    if(di<base+1||di>=sp||si<base+1||si>=sp)die("Haris runtime: invalid local binary operands");
+    Value a=st[di],b=st[si];Op op=(Op)(uintptr_t)code[ip].cache;
+    if(op<I_ADD||op>I_MOD)die("Haris runtime: invalid local binary opcode");
+    if(a.t==VINT&&b.t==VINT)st[di]=vi(int_binop(vm,op,a.u.i,b.u.i));
+    else{if(!isnum(a)||!isnum(b))die("numeric operator needs numbers");double x=dn(a),y=dn(b);if(op==I_DIV&&y==0.0)die("division by zero");st[di]=vf(op==I_ADD?x+y:op==I_SUB?x-y:op==I_MUL?x*y:op==I_DIV?x/y:fmod(x,y));}
+    ip++;DISPATCH();
+}
+L_LOCAL_CMP_JMPF: {
+    int idx=base+1+code[ip].a,ci=code[ip].b;
+    if(idx<base+1||idx>=sp||ci<0||ci>=fn->ch.nc)die("Haris runtime: invalid local comparison operands");
+    Value a=st[idx],b=cons[ci];unsigned ck=code[ip].cache_kind;int r=0;
+    if(ck<1u||ck>6u)die("Haris runtime: invalid local comparison opcode");
+    Op op=(Op)(I_EQ+(int)ck-1);
+    if(a.t==VINT&&b.t==VINT){r=op==I_EQ?a.u.i==b.u.i:op==I_NEQ?a.u.i!=b.u.i:op==I_LT?a.u.i<b.u.i:op==I_LTE?a.u.i<=b.u.i:op==I_GT?a.u.i>b.u.i:a.u.i>=b.u.i;}
+    else{if(!isnum(a)||!isnum(b))die("comparison needs numbers");double x=dn(a),y=dn(b);r=op==I_EQ?x==y:op==I_NEQ?x!=y:op==I_LT?x<y:op==I_LTE?x<=y:op==I_GT?x>y:x>=y;}
+    if(!r)ip=(int)(uintptr_t)code[ip].cache;else ip++;DISPATCH();
+}
+L_GET: {const char*key=fn->ch.names[code[ip].a];if(fn->closure){Value ev;if(env_lookup_chain(fn->closure,key,&ev)){HPUSH(ev);ip++;DISPATCH();}}int ci;if(code[ip].cache_kind==2u)ci=(int)(uintptr_t)code[ip].cache-1;else{ci=code[ip].line-1;if(ci<0||ci>=vm->g.n||strcmp(vm->g.v[ci].k,key)){ci=egi(&vm->g,key);if(ci<0)die("Haris runtime: undefined '%s'",key);code[ip].line=ci+1;}code[ip].cache=(void*)(uintptr_t)(ci+1);code[ip].cache_kind=2u;}if((unsigned)ci>=(unsigned)vm->g.n||strcmp(vm->g.v[ci].k,key))die("Haris runtime: invalid global cache");HPUSH(vm->g.v[ci].v);ip++;DISPATCH();}
+L_SETG: {Value v=st[--sp];const char*key=fn->ch.names[code[ip].a];int ci;if(code[ip].cache_kind==2u)ci=(int)(uintptr_t)code[ip].cache-1;else{ci=code[ip].line-1;if(ci<0||ci>=vm->g.n||strcmp(vm->g.v[ci].k,key))ci=egi(&vm->g,key);if(ci<0){en(&vm->g,key,v);ci=egi(&vm->g,key);}else vm->g.v[ci].v=v;code[ip].line=ci+1;code[ip].cache=(void*)(uintptr_t)(ci+1);code[ip].cache_kind=2u;ip++;DISPATCH();}if((unsigned)ci>=(unsigned)vm->g.n||strcmp(vm->g.v[ci].k,key))die("Haris runtime: invalid global cache");vm->g.v[ci].v=v;ip++;DISPATCH();}
+L_POP: if(sp<=0)die("Haris runtime: value stack underflow"); --sp; ip++; DISPATCH();
+L_NEG: {Value a=HPOP();if(a.t==VINT){if(a.u.i==LLONG_MIN){if(vm->module_sandboxed){vm->int_overflow=1;HPUSH(vi(0));}else die("Haris runtime: integer overflow");}else HPUSH(vi(-a.u.i));}else HPUSH(vf(-dn(a)));ip++;DISPATCH();}
+L_NOT: {Value a=HPOP();HPUSH(vb(!truth(a)));ip++;DISPATCH();}
+L_ADD: case_dummy_add: {
+    Value b=st[--sp],a=st[--sp]; Op op=code[ip].op;
+    if(op==I_ADD&&a.t==VSTR&&b.t==VSTR){size_t na=strlen(a.u.s),nb=strlen(b.u.s);char*z=xmalloc(na+nb+1);memcpy(z,a.u.s,na);memcpy(z+na,b.u.s,nb);z[na+nb]=0;HPUSH(((Value){.t=VSTR,.u.s=z}));ip++;DISPATCH();}
+    if(a.t==VINT&&b.t==VINT){HPUSH(vi(int_binop(vm,op,a.u.i,b.u.i)));ip++;DISPATCH();}
+    if(!isnum(a)||!isnum(b))die("numeric operator needs numbers");
+    double x=dn(a),y=dn(b);
+    if(op==I_DIV&&y==0)die("division by zero");
+    HPUSH(vf(op==I_ADD?x+y:op==I_SUB?x-y:op==I_MUL?x*y:op==I_DIV?x/y:fmod(x,y)));
+    ip++;DISPATCH();
+}
+L_SUB: goto case_dummy_add; L_MUL: goto case_dummy_add; L_DIV: goto case_dummy_add; L_MOD: goto case_dummy_add;
+L_EQ: case_dummy_eq: {
+    if(sp<2)die("Haris runtime: value stack underflow");
+    Value b=st[--sp],a=st[--sp];int r=0;
+    if(a.t==VINT&&b.t==VINT)r=(a.u.i==b.u.i);
+    else if(isnum(a)&&isnum(b))r=(dn(a)==dn(b));
+    else if(a.t==b.t){if(a.t==VNULL)r=1;else if(a.t==VBOOL)r=a.u.b==b.u.b;else if(a.t==VSTR)r=!strcmp(a.u.s,b.u.s);}
+    if(code[ip].op==I_NEQ)r=!r;HPUSH(vb(r));ip++;DISPATCH();
+}
+L_NEQ: goto case_dummy_eq;
+L_LT: case_dummy_cmp: {if(sp<2)die("Haris runtime: value stack underflow");Value b=st[--sp],a=st[--sp];if(a.t==VINT&&b.t==VINT){Op op=code[ip].op;int r=op==I_LT?a.u.i<b.u.i:op==I_LTE?a.u.i<=b.u.i:op==I_GT?a.u.i>b.u.i:a.u.i>=b.u.i;HPUSH(vb(r));ip++;DISPATCH();}if(!isnum(a)||!isnum(b))die("comparison needs numbers");double x=dn(a),y=dn(b);Op op=code[ip].op;int r=op==I_LT?x<y:op==I_LTE?x<=y:op==I_GT?x>y:x>=y;HPUSH(vb(r));ip++;DISPATCH();}
+L_LTE: goto case_dummy_cmp; L_GT: goto case_dummy_cmp; L_GTE: goto case_dummy_cmp;
+L_AND: {Value b=HPOP(),a=HPOP();HPUSH(vb(truth(a)&&truth(b)));ip++;DISPATCH();}
+L_OR:  {Value b=HPOP(),a=HPOP();HPUSH(vb(truth(a)||truth(b)));ip++;DISPATCH();}
+L_JMP: { int target=code[ip].a;
+ if(target<ip){ int ex=ip+1;
+  if(!fn->loop_acc_active && ++fn->loop_hits>=100){
+   if(code[target].op==I_GETL && target+6==ip && (code[target+1].op==I_CONST||code[target+1].op==I_GETL) && code[target+2].op>=I_LT && code[target+2].op<=I_LTE && code[target+3].op==I_JMPF && code[target+4].op==I_LOCAL_BIN && code[target+5].op==I_INC_LOCAL && code[target+6].op==I_JMP){
+    int vi=code[target].a,ac=code[target+4].a;int ci=code[target+1].a;long long lim=0;int lim_local=-1;int lim_is_local=0;int lim_valid=1;if(code[target+1].op==I_CONST){if(ci<0||ci>=fn->ch.nc||fn->ch.c[ci].t!=VINT)lim_valid=0;else lim=fn->ch.c[ci].u.i;}else if(code[target+1].op==I_GETL){lim_is_local=1;lim_local=code[target+1].a;if(lim_local<0||lim_local==vi||lim_local==ac)lim_valid=0;}else lim_valid=0;long long step=(code[target+5].a==vi)?1:0;
+    if(code[target+2].op!=I_LT&&code[target+2].op!=I_LTE)step=0;
+    if(lim_valid&&code[target+3].a==ip+1&&code[target+4].b==vi&&(Op)(uintptr_t)code[target+4].cache==I_ADD&&code[target+5].a==vi&&code[target+6].a==target)jit_compile_accum_loop(fn,target,code[target+3].a,ac,vi,1,code[target+2].op,lim,step,lim_is_local,lim_local);
+   }
+  }
+
+  if(ex<fn->ch.n){
+   /* Optimized local induction loop: GETL/CONST/CMP/JMPF/INC|DEC/JMP. */
+   if(code[target].op==I_GETL && target+5<ex && (code[target+1].op==I_CONST || code[target+1].op==I_GETL) && (code[target+2].op==I_LT||code[target+2].op==I_LTE) && code[target+3].op==I_JMPF && code[target+3].a>ip && code[target+4].op==I_INC_LOCAL && code[target+4].a==code[target].a && code[target+5].op==I_JMP && code[target+5].a==target){
+      long long lim=0;int lim_local=-1;int lim_is_local=(code[target+1].op==I_GETL);int lim_valid=1;
+      if(lim_is_local){lim_local=code[target+1].a;if(lim_local<0||lim_local==code[target].a)lim_valid=0;}
+      else {int ci=code[target+1].a;if(ci<0||ci>=fn->ch.nc||fn->ch.c[ci].t!=VINT)lim_valid=0;else lim=fn->ch.c[ci].u.i;}
+      if(++fn->loop_hits>=100&&!fn->loop_jit_i64&&!fn->loop_jit3_i64&&lim_valid)jit_compile_local_loop_i64(fn,target,code[target+3].a,code[target].a,lim,1,code[target+2].op,lim_is_local,lim_local);
+   } else if(code[target].op==I_LOCAL_CMP_JMPF && target+2==ip && code[target+1].op==I_INC_LOCAL && code[target+1].a==code[target].a && code[target+2].op==I_JMP && code[target+2].a==target){
+      int cmp=(int)code[target].cache_kind>0 ? I_EQ+(int)code[target].cache_kind-1 : I_HALT;int ci=code[target].b;long long lim=0;int lim_valid=(cmp==I_LT||cmp==I_LTE);
+      if(ci<0||ci>=fn->ch.nc||fn->ch.c[ci].t!=VINT)lim_valid=0;else lim=fn->ch.c[ci].u.i;
+      int loop_exit=(int)(uintptr_t)code[target].cache;
+      if(++fn->loop_hits>=100&&!fn->loop_jit_i64&&!fn->loop_jit3_i64&&lim_valid&&loop_exit==ex)jit_compile_fused_local_loop_i64(fn,target,loop_exit,code[target].a,lim,cmp);
+   } else if(code[target].op==I_GET && target+3<ex){
+      int var=code[target].a;
+      if(code[target+1].op==I_CONST && code[target+1].a>=0 && code[target+1].a<fn->ch.nc && fn->ch.c[code[target+1].a].t==VINT && (code[target+2].op==I_LT||code[target+2].op==I_LTE) && code[target+3].op==I_JMPF && code[target+3].a>ip){
+       long long lim=fn->ch.c[code[target+1].a].u.i; int cmp=code[target+2].op; int setpos=ip-1;
+       if(setpos>=target && code[setpos].op==I_SET && code[setpos].a==var && setpos-1>=target && code[setpos-1].op==I_ADD){
+        int cidx=code[setpos-2].a; if(cidx>=0&&cidx<fn->ch.nc&&fn->ch.c[cidx].t==VINT){long long step=fn->ch.c[cidx].u.i; jit_try_loop(fn,target,code[target+3].a,var,lim,step,cmp);}
+       }
+      }
+   }
+  }
+  if(fn->loop_acc_active&&target==fn->loop_acc_start){
+   int ai=base+1+fn->loop_acc_name,vi_idx=base+1+fn->loop_acc_var;
+   Value av=(ai>=base+1&&ai<sp)?st[ai]:vn(),iv=(vi_idx>=base+1&&vi_idx<sp)?st[vi_idx]:vn();
+   long long alimit=fn->loop_acc_limit;if(fn->loop_acc_limit_is_local){int li=base+1+fn->loop_acc_limit_local;Value lv=(li>=base+1&&li<sp)?st[li]:vn();if(lv.t!=VINT){fn->loop_acc_active=0;goto loop_acc_done;}alimit=lv.u.i;}
+   if(av.t==VINT&&iv.t==VINT){long long fa=0,fv=0;if(jit_accum_add_remaining(iv.u.i,alimit,fn->loop_acc_step,fn->loop_acc_cmp,av.u.i,&fa,&fv)){st[ai]=vi(fa);st[vi_idx]=vi(fv);ip=fn->loop_acc_exit;DISPATCH();}}
+   fn->loop_acc_active=0;
+loop_acc_done: ;
+  }
+  if((fn->loop_jit_i64||fn->loop_jit3_i64)&&target==fn->loop_start){
+   if(fn->loop_is_local){
+    int li=base+1+fn->loop_var_name;Value lv=(li>=base+1&&li<sp)?st[li]:vn();
+    long long local_limit=fn->loop_limit;int limit_ok=1;
+    if(fn->loop_limit_is_local){int lidx=base+1+fn->loop_limit_local;Value limv=(lidx>=base+1&&lidx<sp)?st[lidx]:vn();if(limv.t!=VINT)limit_ok=0;else local_limit=limv.u.i;}
+    /* `i <= LLONG_MAX` followed by i++ must still raise Haris' checked
+       integer-overflow error at the final increment. The 2-arg native
+       fixed-point loop cannot represent that overflow, so deopt this case
+       back to the ordinary VM path. */
+    if(limit_ok&&fn->loop_cmp==I_LTE&&local_limit==LLONG_MAX)limit_ok=0;
+    if(limit_ok&&lv.t==VINT){long long curv=lv.u.i;long long finalv=fn->loop_jit3_i64?fn->loop_jit3_i64(curv,local_limit,fn->loop_step):fn->loop_jit_i64(curv,local_limit);st[li]=vi(finalv);ip=fn->loop_exit;DISPATCH();}
+   }
+   else {int gi=egi(&vm->g,fn->ch.names[fn->loop_var_name]);Value gv=(gi>=0?vm->g.v[gi].v:vn());if(gv.t==VINT){long long curv=gv.u.i;long long finalv=fn->loop_jit3_i64?fn->loop_jit3_i64(curv,fn->loop_limit,fn->loop_step):fn->loop_jit_i64(curv,fn->loop_limit);if(gi>=0)vm->g.v[gi].v=vi(finalv);else en(&vm->g,fn->ch.names[fn->loop_var_name],vi(finalv));ip=fn->loop_exit;DISPATCH();}}
+  }
+ }
+ ip=target; DISPATCH(); }
+L_JMPF: {Value a=HPOP();if(!truth(a))ip=code[ip].a;else ip++;DISPATCH();}
+L_MAKE_CLOSURE: {if(sp<1||st[sp-1].t!=VFN)die("Haris runtime: closure expects function");Fn*proto=st[sp-1].u.fn;Fn*c=xmalloc(sizeof(*c));memcpy(c,proto,sizeof(*c));c->name=proto->name;c->params=proto->params;c->locals=proto->locals;c->gens=proto->gens;c->ch=proto->ch;c->closure=xmalloc(sizeof(Env));memset(c->closure,0,sizeof(Env));c->closure->p=fn->closure;if(fn->np+fn->nlocals>0){for(int i=0;i<fn->np+fn->nlocals;i++){const char*k=i<fn->np?fn->params[i]:fn->locals[i-fn->np];int idx=base+1+i;if(idx<sp)en(c->closure,k,st[idx]);}}st[sp-1]=(Value){.t=VFN,.u.fn=c};ip++;DISPATCH();}
+L_CALL: {
+    int n=code[ip].a;if(n<0||n>H_CALL_MAX||sp<n+1)die("Haris runtime: stack underflow/invalid argc in call");
+    Ins *call_ins=&code[ip]; Value *args2=&st[sp-n]; Value cal=st[sp-n-1];
+    if(cal.t==VFN && cal.u.fn->ngens>0){
+        const char *specs[16]={0}; int ns=0;
+        if(code[ip].b>0){
+            int cidx=code[ip].b-1;if(cidx<0||cidx>=fn->ch.nc||fn->ch.c[cidx].t!=VSTR)die("Haris generic: invalid specialization");
+            char tmp[256];snprintf(tmp,sizeof tmp,"%s",fn->ch.c[cidx].u.s);char*save=0;for(char*q=strtok_r(tmp,",",&save);q&&ns<16;q=strtok_r(NULL,",",&save))specs[ns++]=xdup(q);
+            if(cal.u.fn->ngens!=ns)die("Haris generic: expected %d type arguments, got %d",cal.u.fn->ngens,ns);
+        } else {
+            ns=cal.u.fn->ngens;
+            if(!generic_infer_call(cal.u.fn,n,args2,specs,16))die("Haris generic: unable to infer type arguments; use explicit <T,...>");
+        }
+        Fn*spfn=generic_specialize(cal.u.fn,specs,ns);for(int si=0;si<ns;si++)xfree((void*)specs[si]);if(!spfn||!generic_validate_call(spfn,n,args2))die("Haris generic: type arguments do not match call");st[sp-n-1].u.fn=spfn;cal=st[sp-n-1];
+    }
+    if(cal.t==VNATIVE){vm->sp=sp;vm->fp=fp;Value r=cal.u.native(vm,n,args2);sp-=n+1;HPUSH(r);runtime_safe_point(vm,sp,fp);ip++;DISPATCH();}
+    if(cal.t==VBOUND){BoundCall*b=cal.u.bound;if(!b||!b->self)die("invalid bound method");int pos=sp-n-1;if(sp>=8191)die("stack overflow");for(int j=n-1;j>=0;j--)st[pos+2+j]=st[pos+1+j];st[pos]=b->fn?(Value){.t=VFN,.u.fn=b->fn}:(Value){.t=VNATIVE,.u.native=b->native};st[pos+1]=*b->self;sp++;n++;args2=&st[sp-n];cal=st[pos];if(b->native){vm->sp=sp;vm->fp=fp;Value r=b->native(vm,n,args2);sp-=n+1;HPUSH(r);runtime_safe_point(vm,sp,fp);ip++;DISPATCH();}}
+    if(cal.t==VFN){
+        Fn *cf=cal.u.fn;
+        if(cf->is_async){die("Haris Android Game Runtime: async is disabled in the game thread");}
+        cf->calls++;
+        if(call_ins->cache_kind==1 && call_ins->cache!=cf) call_ins->cache_kind=0;
+        if(call_ins->cache_kind==0){call_ins->cache=cf;call_ins->cache_kind=1;}
+        (void)jit_maybe_compile(cf);
+        if(cf->jit_i64){Value jr;if(jit_call_i64(cf,n,args2,&jr)){sp-=n+1;HPUSH(jr);ip++;DISPATCH();}}
+        /* Tail-call elimination: return f(args) reuses the current frame. */
+        if(n==cf->np && ip+1<fn->ch.n && code[ip+1].op==I_RET){
+            int newbase=base;for(int qi=0;qi<n;qi++)st[newbase+1+qi]=args2[qi];sp=newbase+1+n;fn=cf;code=fn->ch.v;cons=fn->ch.c;ip=0;base=newbase;while(sp<base+1+cf->np+cf->nlocals)sp++,st[sp-1]=vn();DISPATCH();
+        }
+        if(fp>=H_CALL_MAX)die("call stack overflow");
+        frames[fp-1].ip=ip+1;frames[fp++]=(Frame){0,sp-n-1,cf};fn=cf;code=fn->ch.v;cons=fn->ch.c;ip=0;base=sp-n-1;while(sp<base+1+cf->np+cf->nlocals)sp++,st[sp-1]=vn();DISPATCH();
+    }
+    die("not callable");
+}
+L_RET: {Value r=HPOP();int oldbase=base;fp--;if(!fp){HRETURN(r);}Frame caller=frames[fp-1];fn=caller.fn;code=fn->ch.v;cons=fn->ch.c;ip=caller.ip;base=caller.base;sp=oldbase;HPUSH(r);DISPATCH();}
+L_ARRAY: {int n=code[ip].a;if(n<0||n>sp)die("Haris runtime: invalid array operands");Value v=va();for(int i=0;i<n;i++)ap(v.u.a,st[sp-n+i]);sp-=n;HPUSH(v);ip++;DISPATCH();}
+L_INDEX: {if(sp<2)die("Haris runtime: value stack underflow");Value idx=st[--sp],obj=st[--sp];if(obj.t==VSTRUCT&&idx.t==VSTR){HPUSH(stget(obj.u.st,idx.u.s));}else if(idx.t==VINT&&obj.t==VARR){long long k=idx.u.i;if(k<0||(size_t)k>=obj.u.a->n)die("array index out of range");HPUSH(obj.u.a->v[k]);}else if(idx.t==VINT&&obj.t==VSTR){long long k=idx.u.i;if(k<0||(size_t)k>=strlen(obj.u.s))die("string index out of range");char z[2]={obj.u.s[k],0};HPUSH(vs(z));}else die("not indexable");ip++;DISPATCH();}
+L_SETINDEX: {if(sp<3)die("Haris runtime: setindex stack underflow");Value val=st[--sp],idx=st[--sp],obj=st[--sp];if(obj.t!=VARR||idx.t!=VINT)die("assignment target must be an array and integer index");long long k=idx.u.i;if(k<0||(size_t)k>=obj.u.a->n)die("array index out of range");obj.u.a->v[k]=val;HPUSH(val);ip++;DISPATCH();}
+L_SETFIELD: {if(sp<3)die("Haris runtime: setfield stack underflow");Value val=st[--sp],key=st[--sp],obj=st[--sp];if(obj.t!=VSTRUCT||key.t!=VSTR)die("assignment target must be a struct and field name");stput(obj.u.st,key.u.s,val);HPUSH(val);ip++;DISPATCH();}
+L_FIELD: {if(sp<2)die("field stack underflow");Value key=st[--sp],obj=st[--sp];if(key.t!=VSTR||obj.t!=VSTRUCT)die("field access requires struct");Value got=stget(obj.u.st,key.u.s);if(got.t==VNULL)got=gmethod_get(obj,key.u.s);HPUSH(got);ip++;DISPATCH();}
+L_STRUCT: {int n=code[ip].a;if(n<0||2*n>sp)die("invalid struct operands");Value v=vsobj();for(int i=0;i<n;i++){Value key=st[sp-2*n+i*2],val=st[sp-2*n+i*2+1];if(key.t!=VSTR)die("struct field name must be string");stput(v.u.st,key.u.s,val);}sp-=2*n;HPUSH(v);ip++;DISPATCH();}
+L_TYPECHECK: {if(sp<1||code[ip].a<0||code[ip].a>=fn->ch.nc)die("typecheck stack error");Value exp=fn->ch.c[code[ip].a];if(exp.t!=VSTR||((!(!strcmp(exp.u.s,"float")&&st[sp-1].t==VINT))&&strcmp(type_name(st[sp-1]),exp.u.s)))die("Haris type error: expected %s, got %s",exp.u.s,type_name(st[sp-1]));ip++;DISPATCH();}
+L_TRY: if(vm->err_depth>=256)die("Haris runtime: try-handler stack overflow"); vm->err_frames[vm->err_depth]=(struct ErrFrame){code[ip].a,fp,sp}; vm->err_depth++; ip++; DISPATCH();
+L_ENDTRY: if(vm->err_depth>0)vm->err_depth--; ip++; DISPATCH();
+L_JMPNULL: {if(sp<1)die("Haris runtime: jmpnull stack underflow");if(st[sp-1].t==VNULL){ip=code[ip].a;}else{ip++;}DISPATCH();}
+L_HALT: HRETURN(sp?st[sp-1]:vn());
+#undef DISPATCH
+#else
+    /* Portable fallback. The same local-stack optimization is retained. */
+    unsigned long long ticks=0; g_runtime_vm=vm;
+    int jumped=setjmp(vm->jmp_stack[jmp_slot]);
+    if(jumped){
+        if(!vm->err_active || vm->err_depth<=0){g_runtime_vm=NULL;die("Haris runtime error: %s",vm->err_msg);}
+        vm->err_active=0; if(vm->err_depth<=0){g_runtime_vm=NULL;die("Haris runtime error: %s",vm->err_msg);} struct ErrFrame eh=vm->err_frames[vm->err_depth-1];vm->err_depth--;vm->err_ip=eh.ip;vm->err_fp=eh.fp;vm->err_sp=eh.sp;sp=eh.sp;fp=eh.fp;Frame *ef=&frames[fp-1];ef->ip=eh.ip;HPUSH(vs(vm->err_msg));
+    }
+    for(;;){if((++ticks & 4095u)==0){runtime_budget_check(vm);if(g_mem_used>=g_gc_next){vm->sp=sp;vm->fp=fp;if(gc_minor(vm)==0 || g_mem_used>=g_gc_next*2)gc_collect(vm);}}Frame*fr=&frames[fp-1];Ins in=fr->fn->ch.v[fr->ip++];switch(in.op){
+        case I_CONST:HPUSH(fr->fn->ch.c[in.a]);break;case I_GETL:{int idx=fr->base+1+in.a;if(idx>=sp)die("Haris runtime: invalid local/argument index");HPUSH(st[idx]);break;}case I_SETL:{int idx=fr->base+1+in.a;if(idx<fr->base+1||idx>=sp)die("Haris runtime: invalid local slot");st[idx]=st[--sp];break;}case I_INC_LOCAL:{int idx=fr->base+1+in.a;if(idx<fr->base+1||idx>=sp)die("Haris runtime: invalid local slot");Value v=st[idx];if(v.t==VINT)st[idx]=vi(int_binop(vm,I_ADD,v.u.i,1));else if(v.t==VFLOAT)st[idx]=vf(v.u.f+1.0);else die("numeric operator needs number");break;}case I_DEC_LOCAL:{int idx=fr->base+1+in.a;if(idx<fr->base+1||idx>=sp)die("Haris runtime: invalid local slot");Value v=st[idx];if(v.t==VINT)st[idx]=vi(int_binop(vm,I_SUB,v.u.i,1));else if(v.t==VFLOAT)st[idx]=vf(v.u.f-1.0);else die("numeric operator needs number");break;}case I_LOCAL_CONST_ADD:case I_LOCAL_CONST_SUB:case I_LOCAL_CONST_MUL:case I_LOCAL_CONST_DIV:case I_LOCAL_CONST_MOD:{int idx=fr->base+1+in.a;if(idx<fr->base+1||idx>=sp||in.b<0||in.b>=fr->fn->ch.nc)die("Haris runtime: invalid specialized arithmetic operands");Value v=st[idx],cst=fr->fn->ch.c[in.b];Op op=(Op)in.op;if(v.t==VINT&&cst.t==VINT)st[idx]=vi(int_binop(vm,op==I_LOCAL_CONST_ADD?I_ADD:op==I_LOCAL_CONST_SUB?I_SUB:op==I_LOCAL_CONST_MUL?I_MUL:op==I_LOCAL_CONST_DIV?I_DIV:I_MOD,v.u.i,cst.u.i));else if(isnum(v)&&cst.t==VINT){double y=(double)cst.u.i;Op bop=(op==I_LOCAL_CONST_ADD?I_ADD:op==I_LOCAL_CONST_SUB?I_SUB:op==I_LOCAL_CONST_MUL?I_MUL:op==I_LOCAL_CONST_DIV?I_DIV:I_MOD);if(bop==I_DIV&&y==0.0)die("division by zero");st[idx]=vf(bop==I_ADD?v.u.f+y:bop==I_SUB?v.u.f-y:bop==I_MUL?v.u.f*y:bop==I_DIV?v.u.f/y:fmod(v.u.f,y));}else die("numeric operator needs numbers");break;}case I_LOCAL_BIN:{int di=fr->base+1+in.a,si=fr->base+1+in.b;if(di<fr->base+1||di>=sp||si<fr->base+1||si>=sp)die("Haris runtime: invalid local binary operands");Value a=st[di],b=st[si];Op op=(Op)(uintptr_t)in.cache;if(op<I_ADD||op>I_MOD)die("Haris runtime: invalid local binary opcode");if(a.t==VINT&&b.t==VINT)st[di]=vi(int_binop(vm,op,a.u.i,b.u.i));else{if(!isnum(a)||!isnum(b))die("numeric operator needs numbers");double x=dn(a),y=dn(b);if(op==I_DIV&&y==0.0)die("division by zero");st[di]=vf(op==I_ADD?x+y:op==I_SUB?x-y:op==I_MUL?x*y:op==I_DIV?x/y:fmod(x,y));}break;}case I_LOCAL_CMP_JMPF:{int idx=fr->base+1+in.a,ci=in.b;if(idx<fr->base+1||idx>=sp||ci<0||ci>=fr->fn->ch.nc)die("Haris runtime: invalid local comparison operands");Value a=st[idx],b=fr->fn->ch.c[ci];Op op=(Op)(I_EQ+(int)(in.cache_kind?in.cache_kind-1:0));int r=0;if(op>I_GTE)die("Haris runtime: invalid local comparison opcode");if(a.t==VINT&&b.t==VINT)r=op==I_EQ?a.u.i==b.u.i:op==I_NEQ?a.u.i!=b.u.i:op==I_LT?a.u.i<b.u.i:op==I_LTE?a.u.i<=b.u.i:op==I_GT?a.u.i>b.u.i:a.u.i>=b.u.i;else{if(!isnum(a)||!isnum(b))die("comparison needs numbers");double x=dn(a),y=dn(b);r=op==I_EQ?x==y:op==I_NEQ?x!=y:op==I_LT?x<y:op==I_LTE?x<=y:op==I_GT?x>y:x>=y;}if(!r)fr->ip=(int)(uintptr_t)in.cache;break;}
+        case I_GET:{const char*key=fr->fn->ch.names[in.a];if(fr->fn->closure&&env_has_chain(fr->fn->closure,key)){HPUSH(env_get_chain(fr->fn->closure,key));break;}int ci=fr->fn->ch.v[fr->ip-1].line-1;if(ci<0||ci>=vm->g.n||strcmp(vm->g.v[ci].k,key)){ci=egi(&vm->g,key);if(ci<0)die("Haris runtime: undefined '%s'",key);fr->fn->ch.v[fr->ip-1].line=ci+1;}HPUSH(vm->g.v[ci].v);break;}
+        case I_SET:{Value v=st[--sp];int ci=fr->fn->ch.v[fr->ip-1].line-1;if(ci<0||ci>=vm->g.n||strcmp(vm->g.v[ci].k,fr->fn->ch.names[in.a]))ci=egi(&vm->g,fr->fn->ch.names[in.a]);if(ci>=0)vm->g.v[ci].v=v;else en(&vm->g,fr->fn->ch.names[in.a],v);if(ci<0)ci=egi(&vm->g,fr->fn->ch.names[in.a]);fr->fn->ch.v[fr->ip-1].line=ci+1;break;}case I_POP:if(sp<=0)die("Haris runtime: value stack underflow");--sp;break;
+        case I_NEG:{Value a=HPOP();if(a.t==VINT&&a.u.i==LLONG_MIN){if(vm->module_sandboxed){vm->int_overflow=1;HPUSH(vi(0));}else die("Haris runtime: integer overflow");}else HPUSH(a.t==VINT?vi(-a.u.i):vf(-dn(a)));break;}case I_NOT:{Value a=HPOP();HPUSH(vb(!truth(a)));break;}
+        case I_ADD:case I_SUB:case I_MUL:case I_DIV:case I_MOD:{if(sp<2)die("Haris runtime: value stack underflow");Value b=st[--sp],a=st[--sp];if(in.op==I_ADD&&a.t==VSTR&&b.t==VSTR){size_t na=strlen(a.u.s),nb=strlen(b.u.s);char*z=xmalloc(na+nb+1);memcpy(z,a.u.s,na);memcpy(z+na,b.u.s,nb);z[na+nb]=0;HPUSH(((Value){.t=VSTR,.u.s=z}));break;}if(a.t==VINT&&b.t==VINT){HPUSH(vi(int_binop(vm,in.op,a.u.i,b.u.i)));break;}if(!isnum(a)||!isnum(b))die("numeric operator needs numbers");double x=dn(a),y=dn(b);if(in.op==I_DIV&&y==0)die("division by zero");HPUSH(vf(in.op==I_ADD?x+y:in.op==I_SUB?x-y:in.op==I_MUL?x*y:in.op==I_DIV?x/y:fmod(x,y)));break;}
+        case I_EQ:case I_NEQ:{if(sp<2)die("Haris runtime: value stack underflow");Value b=st[--sp],a=st[--sp];int r=0;if(a.t==VINT&&b.t==VINT)r=a.u.i==b.u.i;else if(isnum(a)&&isnum(b))r=dn(a)==dn(b);else if(a.t==b.t){if(a.t==VNULL)r=1;else if(a.t==VBOOL)r=a.u.b==b.u.b;else if(a.t==VSTR)r=!strcmp(a.u.s,b.u.s);}if(in.op==I_NEQ)r=!r;HPUSH(vb(r));break;}
+        case I_LT:case I_LTE:case I_GT:case I_GTE:{if(sp<2)die("Haris runtime: value stack underflow");Value b=st[--sp],a=st[--sp];if(a.t==VINT&&b.t==VINT){int r=in.op==I_LT?a.u.i<b.u.i:in.op==I_LTE?a.u.i<=b.u.i:in.op==I_GT?a.u.i>b.u.i:a.u.i>=b.u.i;HPUSH(vb(r));break;}if(!isnum(a)||!isnum(b))die("comparison needs numbers");double x=dn(a),y=dn(b);int r=in.op==I_LT?x<y:in.op==I_LTE?x<=y:in.op==I_GT?x>y:x>=y;HPUSH(vb(r));break;}case I_AND:{Value b=st[--sp],a=st[--sp];HPUSH(vb(truth(a)&&truth(b)));break;}case I_OR:{Value b=st[--sp],a=st[--sp];HPUSH(vb(truth(a)||truth(b)));break;}
+        case I_JMP:{int target=in.a;if(target<fr->ip-1 && (fr->fn->loop_jit_i64||fr->fn->loop_jit3_i64)){int gi=egi(&vm->g,fr->fn->ch.names[fr->fn->loop_var_name]);Value gv=(gi>=0?vm->g.v[gi].v:vn());if(gv.t==VINT){long long fv=fr->fn->loop_jit3_i64?fr->fn->loop_jit3_i64(gv.u.i,fr->fn->loop_limit,fr->fn->loop_step):fr->fn->loop_jit_i64(gv.u.i,fr->fn->loop_limit);if(gi>=0)vm->g.v[gi].v=vi(fv);else en(&vm->g,fr->fn->ch.names[fr->fn->loop_var_name],vi(fv));fr->ip=fr->fn->loop_exit;break;}}fr->ip=target;break;}case I_JMPF:{Value a=st[--sp];if(!truth(a))fr->ip=in.a;break;}
+        case I_MAKE_CLOSURE:{if(sp<1||st[sp-1].t!=VFN)die("Haris runtime: closure expects function");Fn*proto=st[sp-1].u.fn;Fn*c=xmalloc(sizeof(*c));memcpy(c,proto,sizeof(*c));c->closure=xmalloc(sizeof(Env));memset(c->closure,0,sizeof(Env));c->closure->p=fr->fn->closure;if(fr->fn->np+fr->fn->nlocals>0){for(int i=0;i<fr->fn->np+fr->fn->nlocals;i++){const char*k=i<fr->fn->np?fr->fn->params[i]:fr->fn->locals[i-fr->fn->np];int idx=fr->base+1+i;if(idx<sp)en(c->closure,k,st[idx]);}}st[sp-1]=(Value){.t=VFN,.u.fn=c};break;}case I_CALL:{int n=in.a;if(n<0||n>H_CALL_MAX||sp<n+1)die("Haris runtime: stack underflow/invalid argc in call");Ins *call_ins=&in;Value*args2=&st[sp-n];Value cal=st[sp-n-1];if(cal.t==VFN&&cal.u.fn->ngens>0){const char*specs[16]={0};int ns=0;if(in.b>0){int cidx=in.b-1;if(cidx<0||cidx>=fr->fn->ch.nc||fr->fn->ch.c[cidx].t!=VSTR)die("Haris generic: invalid specialization");char tmp[256];snprintf(tmp,sizeof tmp,"%s",fr->fn->ch.c[cidx].u.s);char*save=0;for(char*q=strtok_r(tmp,",",&save);q&&ns<16;q=strtok_r(NULL,",",&save))specs[ns++]=xdup(q);}else{ns=cal.u.fn->ngens;if(!generic_infer_call(cal.u.fn,n,args2,specs,16))die("Haris generic: unable to infer type arguments; use explicit <T,...>");}if(cal.u.fn->ngens!=ns)die("Haris generic: expected %d type arguments, got %d",cal.u.fn->ngens,ns);Fn*spfn=generic_specialize(cal.u.fn,specs,ns);for(int si=0;si<ns;si++)xfree((void*)specs[si]);if(!spfn||!generic_validate_call(spfn,n,args2))die("Haris generic: type arguments do not match call");st[sp-n-1].u.fn=spfn;cal=st[sp-n-1];}if(cal.t==VNATIVE){vm->sp=sp;vm->fp=fp;Value r=cal.u.native(vm,n,args2);sp-=n+1;HPUSH(r);runtime_safe_point(vm,sp,fp);break;}else if(cal.t==VBOUND){BoundCall*b=cal.u.bound;if(!b||!b->self)die("invalid bound method");int pos=sp-n-1;for(int j=n-1;j>=0;j--)st[pos+2+j]=st[pos+1+j];st[pos]=b->fn?(Value){.t=VFN,.u.fn=b->fn}:(Value){.t=VNATIVE,.u.native=b->native};st[pos+1]=*b->self;sp++;n++;args2=&st[sp-n];cal=st[pos];if(b->native){vm->sp=sp;vm->fp=fp;Value r=b->native(vm,n,args2);sp-=n+1;HPUSH(r);runtime_safe_point(vm,sp,fp);break;}}else if(cal.t==VFN){Fn *cf=cal.u.fn;if(cf->is_async){die("Haris Android Game Runtime: async is disabled in the game thread");}cf->calls++;(void)jit_maybe_compile(cf);Value jr;if(jit_call_i64(cf,n,args2,&jr)){sp-=n+1;HPUSH(jr);break;}if(call_ins->cache_kind==1&&call_ins->cache!=cf)call_ins->cache_kind=0;if(call_ins->cache_kind==0){call_ins->cache=cf;call_ins->cache_kind=1;}if(n==cf->np&&fr->ip<cf->ch.n&&cf->ch.v[fr->ip].op==I_RET){int newbase=fr->base;for(int qi=0;qi<n;qi++)st[newbase+1+qi]=args2[qi];sp=newbase+1+n;fr->fn=cf;fr->ip=0;while(sp<newbase+1+cf->np+cf->nlocals)sp++,st[sp-1]=vn();break;}if(fp>=H_CALL_MAX)die("call stack overflow");frames[fp-1].ip=fr->ip;frames[fp++]=(Frame){0,sp-n-1,cf};while(sp<frames[fp-1].base+1+cf->np+cf->nlocals)sp++,st[sp-1]=vn();}else die("not callable");break;}
+        case I_RET:{Value r=HPOP();int b=fr->base;fp--;if(!fp){HRETURN(r);}fr=&frames[fp-1];sp=b;/* caller ip was saved at call */HPUSH(r);break;}
+        case I_ARRAY:{int n=in.a;if(n<0||n>sp)die("Haris runtime: invalid array operands");Value v=va();for(int i=0;i<n;i++)ap(v.u.a,st[sp-n+i]);sp-=n;HPUSH(v);break;}
+        case I_INDEX:{if(sp<2)die("Haris runtime: value stack underflow");Value idx=st[--sp],obj=st[--sp];if(obj.t==VSTRUCT&&idx.t==VSTR){HPUSH(stget(obj.u.st,idx.u.s));}else if(idx.t==VINT&&obj.t==VARR){long long k=idx.u.i;if(k<0||(size_t)k>=obj.u.a->n)die("array index out of range");HPUSH(obj.u.a->v[k]);}else if(idx.t==VINT&&obj.t==VSTR){long long k=idx.u.i;if(k<0||(size_t)k>=strlen(obj.u.s))die("string index out of range");char z[2]={obj.u.s[k],0};HPUSH(vs(z));}else die("not indexable");break;}case I_SETINDEX:{if(sp<3)die("Haris runtime: setindex stack underflow");Value val=st[--sp],idx=st[--sp],obj=st[--sp];if(obj.t!=VARR||idx.t!=VINT)die("assignment target must be an array and integer index");long long k=idx.u.i;if(k<0||(size_t)k>=obj.u.a->n)die("array index out of range");obj.u.a->v[k]=val;HPUSH(val);break;}case I_FIELD:{if(sp<2)die("field stack underflow");Value key=st[--sp],obj=st[--sp];if(key.t!=VSTR||obj.t!=VSTRUCT)die("field access requires struct");Value got=stget(obj.u.st,key.u.s);if(got.t==VNULL)got=gmethod_get(obj,key.u.s);HPUSH(got);break;}case I_SETFIELD:{if(sp<3)die("Haris runtime: setfield stack underflow");Value val=st[--sp],key=st[--sp],obj=st[--sp];if(obj.t!=VSTRUCT||key.t!=VSTR)die("assignment target must be a struct and field name");stput(obj.u.st,key.u.s,val);HPUSH(val);break;}case I_STRUCT:{int n=in.a;if(n<0||2*n>sp)die("invalid struct operands");Value v=vsobj();for(int i=0;i<n;i++){Value key=st[sp-2*n+i*2],val=st[sp-2*n+i*2+1];if(key.t!=VSTR)die("struct field name must be string");stput(v.u.st,key.u.s,val);}sp-=2*n;HPUSH(v);break;}case I_TYPECHECK:{if(sp<1||in.a<0||in.a>=fr->fn->ch.nc)die("typecheck stack error");Value exp=fr->fn->ch.c[in.a];if(exp.t!=VSTR||((!(!strcmp(exp.u.s,"float")&&st[sp-1].t==VINT))&&strcmp(type_name(st[sp-1]),exp.u.s)))die("Haris type error: expected %s, got %s",exp.u.s,type_name(st[sp-1]));break;}case I_TRY:if(vm->err_depth>=256)die("Haris runtime: try-handler stack overflow");vm->err_frames[vm->err_depth]=(struct ErrFrame){in.a,fp,sp};vm->err_depth++;break;case I_ENDTRY:if(vm->err_depth>0)vm->err_depth--;break;case I_JMPNULL:{if(sp<1)die("Haris runtime: jmpnull stack underflow");if(st[sp-1].t==VNULL){fr->ip=in.a;}break;}case I_HALT:HRETURN(sp?st[sp-1]:vn());default:die("bad opcode");}}
+#endif
+}
+
+/* Public execution entry point: validation/policy stays here, while the
+   bytecode engine itself lives in vm_execute().  This keeps future runtime
+   scheduling, tracing, and alternate interpreters out of the opcode loop. */
+/* Public execution facade: keep validation here; VM/JIT execution lives in vm_execute(). */
+Value run(VM*vm,Fn*f,int argc,Value*args){
+    if(!vm||!f||argc<0||argc>H_CALL_MAX) return vn();
+    if(argc && !args) return vn();
+    return vm_execute(vm,f,argc,args);
+}
+

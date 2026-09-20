@@ -1,0 +1,52 @@
+# Haris 2D Android Engine demo
+win = game2d.window(1280, 720, "Haris 2D Engine")
+player = game2d.body(608, 420, 64, 64, "#37d4ff")
+ground = game2d.body(0, 610, 1280, 110, "#1d2945")
+game2d.body_set(player, "gravity", 1450)
+
+fn update(dt) {
+    let vx = 0
+    if game2d.key_down("left") { vx = -320 }
+    if game2d.key_down("right") { vx = 320 }
+
+    if game2d.touch_down() {
+        let tx = game2d.touch_x()
+        if tx < 640 { vx = -320 }
+        if tx >= 640 { vx = 320 }
+    }
+
+    if game2d.key_pressed("space") { game2d.body_set(player, "vy", -560) }
+    if game2d.touch_pressed() { game2d.body_set(player, "vy", -560); game2d.sound("tap", 0.55); game2d.vibrate(12) }
+
+    game2d.body_set(player, "vx", vx)
+    game2d.body_step(player, dt)
+
+    if game2d.collide(player, ground) { game2d.resolve(player, ground) }
+    if player.x < 0 { player.x = 0 }
+    if player.x > 1216 { player.x = 1216 }
+
+    game2d.begin(win, "#08111f")
+
+    # Backdrop
+    game2d.rect(0, 500, 1280, 220, "#101a30", true)
+    game2d.line(0, 610, 1280, 610, "#30446f", 3)
+    game2d.circle(1100, 110, 46, "#ffd166", true)
+
+    # Platform and animated player sprite sheet
+    game2d.body_draw(ground)
+    let frame = game2d.anim_frame(game2d.time(), 8, 4)
+    game2d.sprite_frame("player_sheet", player.x, player.y, 64, 64, frame, 4, 1)
+
+    game2d.screen_text(28, 44, "HARIS 2D ENGINE", "#ffffff", 28)
+    game2d.screen_text(28, 78, "Touch left/right to move • tap to jump", "#9fb2d0", 18)
+    game2d.screen_text(28, 112, "VM + JIT + Canvas + Touch + Audio + Physics", "#6fdff5", 16)
+    game2d.screen_text(1110, 44, "60 FPS target", "#ffffff", 18)
+
+    # Touch zones
+    game2d.rect(28, 635, 160, 58, "#223457cc", true)
+    game2d.rect(1092, 635, 160, 58, "#223457cc", true)
+    game2d.screen_text(72, 673, "LEFT", "#ffffff", 18)
+    game2d.screen_text(1135, 673, "RIGHT", "#ffffff", 18)
+}
+
+game2d.run(win, update, 60)
